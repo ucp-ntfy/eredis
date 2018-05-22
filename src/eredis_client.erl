@@ -27,7 +27,7 @@
 %% API
 -export([start_link/6, stop/1, select_database/2]).
 
--export([do_sync_command/2]).
+-export([do_sync_command/2,authenticate/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -315,19 +315,27 @@ select_database(Socket, Database) ->
 authenticate(_Socket, <<>>) ->
     ok;
 authenticate(Socket, Password) ->
-    do_sync_command(Socket, ["AUTH", " ", Password, "\r\n"]).
+    OK = <<"+OK\r\n">>,
+    NoPassword = <<"-ERR Client sent AUTH, but no password is set\r\n">>,
+    do_sync_command(Socket, ["AUTH", " ", Password, "\r\n"], [OK, NoPassword]).
 
 %% @doc: Executes the given command synchronously, expects Redis to
 %% return "+OK\r\n", otherwise it will fail.
 do_sync_command(Socket, Command) ->
+    do_sync_command(Socket, Command, [<<"+OK\r\n">>]).
+
+do_sync_command(Socket, Command, ExpectedResutls) ->
     ok = inet:setopts(Socket, [{active, false}]),
     case gen_tcp:send(Socket, Command) of
         ok ->
             %% Hope there's nothing else coming down on the socket..
             case gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) of
-                {ok, <<"+OK\r\n">>} ->
+                {ok, Data} ->
                     ok = inet:setopts(Socket, [{active, once}]),
-                    ok;
+                    case lists:any(fun(Result) -> Result == Data end, ExpectedResutls) of
+                        true -> ok;
+                        false -> {error, {unexpected_data, {ok, Data}}}
+                    end;
                 Other ->
                     {error, {unexpected_data, Other}}
             end;
