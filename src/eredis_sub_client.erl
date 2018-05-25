@@ -106,21 +106,21 @@ handle_cast({ack_message, Pid},
     {noreply, NewState};
 
 handle_cast({subscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("SUBSCRIBE", State, Channels, add_channels/2).
+    handle_cast_internal("SUBSCRIBE", State, Channels, add_channels/2);
 
 
 handle_cast({psubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("PSUBSCRIBE", State, Channels, add_channels/2).
+    handle_cast_internal("PSUBSCRIBE", State, Channels, add_channels/2);
 
 
 
 handle_cast({unsubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("UNSUBSCRIBE", State, Channels, remove_channels/2).
+    handle_cast_internal("UNSUBSCRIBE", State, Channels, remove_channels/2);
 
 
 
 handle_cast({punsubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("PUNSUBSCRIBE", State, Channels, remove_channels/2).
+    handle_cast_internal("PUNSUBSCRIBE", State, Channels, remove_channels/2);
 
 
 
