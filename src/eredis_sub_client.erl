@@ -106,21 +106,21 @@ handle_cast({ack_message, Pid},
     {noreply, NewState};
 
 handle_cast({subscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("SUBSCRIBE", State, Channels, add_channels/2);
+    handle_cast_internal("SUBSCRIBE", State, Channels, fun add_channels/2);
 
 
 handle_cast({psubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("PSUBSCRIBE", State, Channels, add_channels/2);
+    handle_cast_internal("PSUBSCRIBE", State, Channels, fun add_channels/2);
 
 
 
 handle_cast({unsubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("UNSUBSCRIBE", State, Channels, remove_channels/2);
+    handle_cast_internal("UNSUBSCRIBE", State, Channels, fun remove_channels/2);
 
 
 
 handle_cast({punsubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    handle_cast_internal("PUNSUBSCRIBE", State, Channels, remove_channels/2);
+    handle_cast_internal("PUNSUBSCRIBE", State, Channels, fun remove_channels/2);
 
 
 
@@ -135,7 +135,7 @@ handle_cast_internal(CmdName, State, Channels, ModifyChannels) ->
     NewState = auth_on_the_fly(State),
     ok = gen_tcp:send(NewState#state.socket, Command),
     NewChannels = ModifyChannels(Channels, NewState#state.channels),
-    {noreply, NewState#state{channels = NewChannels}};
+    {noreply, NewState#state{channels = NewChannels}}.
 
 %% Receive data from socket, see handle_response/2
 handle_info({tcp, _Socket, Bs}, State) ->
@@ -308,7 +308,7 @@ connect(State) ->
         {ok, Socket} ->
             case authenticate(Socket, State#state.password) of
                 ok ->
-                    {ok, State#state{socket = Socket, pass = done}};
+                    {ok, State#state{socket = Socket, password = done}};
                 skip ->
                     {ok, State#state{socket = Socket}};
                 {error, Reason} ->
@@ -323,7 +323,9 @@ authenticate(Socket, Password) ->
     eredis_client:authenticate(Socket, Password).
 
 auth_on_the_fly(State) ->
-    eredis_client:auth_on_the_fly(State).
+    State.
+% NOTE: eredis_client has different state record
+%    eredis_client:auth_on_the_fly(State).
 
 
 %% @doc: Loop until a connection can be established, this includes
