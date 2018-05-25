@@ -331,7 +331,7 @@ get_redis_password() ->
 
 authenticate(_Socket, <<>>) ->
     skip;
-authenticate(Socket, Password) ->
+authenticate(Sock, Pass) ->
     {ok, Opts} = inet:getopts(Sock, [active]),
     ok = inet:setopts(Sock, [{active, false}]),
     Result = case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
@@ -350,7 +350,7 @@ authenticate(Socket, Password) ->
 
 auth_on_the_fly(#state{password = done} = State) ->
     State;
-auth_on_the_fly(#state{sock = Sock} = State) ->
+auth_on_the_fly(#state{socket = Socket} = State) ->
     case authenticate(Socket, get_redis_password()) of
         ok ->
             State#state{password = done};
