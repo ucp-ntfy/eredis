@@ -106,33 +106,21 @@ handle_cast({ack_message, Pid},
     {noreply, NewState};
 
 handle_cast({subscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    Command = eredis:create_multibulk(["SUBSCRIBE" | Channels]),
-    ok = gen_tcp:send(State#state.socket, Command),
-    NewChannels = add_channels(Channels, State#state.channels),
-    {noreply, State#state{channels = NewChannels}};
+    handle_cast_internal("SUBSCRIBE", State, Channels, add_channels/2).
 
 
 handle_cast({psubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    Command = eredis:create_multibulk(["PSUBSCRIBE" | Channels]),
-    ok = gen_tcp:send(State#state.socket, Command),
-    NewChannels = add_channels(Channels, State#state.channels),
-    {noreply, State#state{channels = NewChannels}};
+    handle_cast_internal("PSUBSCRIBE", State, Channels, add_channels/2).
 
 
 
 handle_cast({unsubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    Command = eredis:create_multibulk(["UNSUBSCRIBE" | Channels]),
-    ok = gen_tcp:send(State#state.socket, Command),
-    NewChannels = remove_channels(Channels, State#state.channels),
-    {noreply, State#state{channels = NewChannels}};
+    handle_cast_internal("UNSUBSCRIBE", State, Channels, remove_channels/2).
 
 
 
 handle_cast({punsubscribe, Pid, Channels}, #state{controlling_process = {_, Pid}} = State) ->
-    Command = eredis:create_multibulk(["PUNSUBSCRIBE" | Channels]),
-    ok = gen_tcp:send(State#state.socket, Command),
-    NewChannels = remove_channels(Channels, State#state.channels),
-    {noreply, State#state{channels = NewChannels}};
+    handle_cast_internal("PUNSUBSCRIBE", State, Channels, remove_channels/2).
 
 
 
@@ -142,6 +130,12 @@ handle_cast({ack_message, _}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_cast_internal(CmdName, State, Channels, ModifyChannels) ->
+    Command = eredis:create_multibulk([CmdName | Channels]),
+    NewState = auth_on_the_fly(State),
+    ok = gen_tcp:send(NewState#state.socket, Command),
+    NewChannels = ModifyChannels(Channels, NewState#state.channels),
+    {noreply, NewState#state{channels = NewChannels}};
 
 %% Receive data from socket, see handle_response/2
 handle_info({tcp, _Socket, Bs}, State) ->
@@ -314,6 +308,8 @@ connect(State) ->
         {ok, Socket} ->
             case authenticate(Socket, State#state.password) of
                 ok ->
+                    {ok, State#state{socket = Socket, pass = done}};
+                skip ->
                     {ok, State#state{socket = Socket}};
                 {error, Reason} ->
                     {error, {authentication_error, Reason}}
@@ -325,6 +321,9 @@ connect(State) ->
 
 authenticate(Socket, Password) ->
     eredis_client:authenticate(Socket, Password).
+
+auth_on_the_fly(State) ->
+    eredis_client:auth_on_the_fly(State).
 
 
 %% @doc: Loop until a connection can be established, this includes

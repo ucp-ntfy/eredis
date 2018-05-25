@@ -27,7 +27,7 @@
 %% API
 -export([start_link/6, stop/1, select_database/2]).
 
--export([do_sync_command/2,authenticate/2]).
+-export([do_sync_command/2, authenticate/2, auth_on_the_fly/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -36,7 +36,7 @@
 -record(state, {
           host :: string() | undefined,
           port :: integer() | undefined,
-          password :: binary() | undefined,
+          password :: binary() | undefined | done,
           database :: binary() | undefined,
           reconnect_sleep :: reconnect_sleep() | undefined,
           connect_timeout :: integer() | undefined,
@@ -88,10 +88,12 @@ init([Host, Port, Database, Password, ReconnectSleep, ConnectTimeout]) ->
     end.
 
 handle_call({request, Req}, From, State) ->
-    do_request(Req, From, State);
+    NewState = auth_on_the_fly(State),
+    do_request(Req, From, NewState);
 
 handle_call({pipeline, Pipeline}, From, State) ->
-    do_pipeline(Pipeline, From, State);
+    NewState = auth_on_the_fly(State),
+    do_pipeline(Pipeline, From, NewState);
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -101,7 +103,8 @@ handle_call(_Request, _From, State) ->
 
 
 handle_cast({request, Req}, State) ->
-    case do_request(Req, undefined, State) of
+    NewState = auth_on_the_fly(State),
+    case do_request(Req, undefined, NewState) of
         {reply, _Reply, State1} ->
             {noreply, State1};
         {noreply, State1} ->
@@ -291,10 +294,17 @@ connect(State) ->
                          ?SOCKET_OPTS, State#state.connect_timeout) of
         {ok, Socket} ->
             case authenticate(Socket, State#state.password) of
-                ok ->
+                skip ->
                     case select_database(Socket, State#state.database) of
                         ok ->
                             {ok, State#state{socket = Socket}};
+                        {error, Reason} ->
+                            {error, {select_error, Reason}}
+                    end;
+                ok ->
+                    case select_database(Socket, State#state.database) of
+                        ok ->
+                            {ok, State#state{socket = Socket, password = done}};
                         {error, Reason} ->
                             {error, {select_error, Reason}}
                     end;
@@ -312,30 +322,53 @@ select_database(_Socket, <<"0">>) ->
 select_database(Socket, Database) ->
     do_sync_command(Socket, ["SELECT", " ", Database, "\r\n"]).
 
+get_redis_password() ->
+    PassFile = "/usr/local/etc/redis-pass.secret",
+    case file:read_file(PassFile) of
+        {ok, Pass} -> Pass;
+        _ -> <<>>
+    end.
+
 authenticate(_Socket, <<>>) ->
-    ok;
+    skip;
 authenticate(Socket, Password) ->
-    OK = <<"+OK\r\n">>,
-    NoPassword = <<"-ERR Client sent AUTH, but no password is set\r\n">>,
-    do_sync_command(Socket, ["AUTH", " ", Password, "\r\n"], [OK, NoPassword]).
+    {ok, Opts} = inet:getopts(Sock, [active]),
+    ok = inet:setopts(Sock, [{active, false}]),
+    Result = case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
+        ok ->
+            case gen_tcp:recv(Sock, 0) of
+                {ok, <<"+OK\r\n">>} -> ok;
+                {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> skip;
+                {ok, Err} -> {error, Err};
+                Err -> Err
+            end;
+        Err ->
+            Err
+    end,
+    ok = inet:setopts(Sock, Opts),
+    Result.
+
+auth_on_the_fly(#state{password = done} = State) ->
+    State;
+auth_on_the_fly(#state{sock = Sock} = State) ->
+    case authenticate(Socket, get_redis_password()) of
+        ok ->
+            State#state{password = done};
+        _ ->
+            State
+    end.
 
 %% @doc: Executes the given command synchronously, expects Redis to
 %% return "+OK\r\n", otherwise it will fail.
 do_sync_command(Socket, Command) ->
-    do_sync_command(Socket, Command, [<<"+OK\r\n">>]).
-
-do_sync_command(Socket, Command, ExpectedResutls) ->
     ok = inet:setopts(Socket, [{active, false}]),
     case gen_tcp:send(Socket, Command) of
         ok ->
             %% Hope there's nothing else coming down on the socket..
             case gen_tcp:recv(Socket, 0, ?RECV_TIMEOUT) of
-                {ok, Data} ->
+                {ok, <<"+OK\r\n">>} ->
                     ok = inet:setopts(Socket, [{active, once}]),
-                    case lists:any(fun(Result) -> Result == Data end, ExpectedResutls) of
-                        true -> ok;
-                        false -> {error, {unexpected_data, {ok, Data}}}
-                    end;
+                    ok;
                 Other ->
                     {error, {unexpected_data, Other}}
             end;
