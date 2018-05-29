@@ -380,7 +380,7 @@ do_sync_command(Socket, Command) ->
 %% successfully issuing the auth and select calls. When we have a
 %% connection, give the socket to the redis client.
 reconnect_loop(Client, #state{reconnect_sleep = ReconnectSleep} = State) ->
-    case catch(connect(State)) of
+    case catch(connect(State#state{password = get_redis_password()})) of
         {ok, #state{socket = Socket}} ->
             gen_tcp:controlling_process(Socket, Client),
             Client ! {connection_ready, Socket};
