@@ -323,10 +323,14 @@ select_database(Socket, Database) ->
     do_sync_command(Socket, ["SELECT", " ", Database, "\r\n"]).
 
 get_redis_password() ->
-    PassFile = "/usr/local/etc/redis-pass.secret",
-    case file:read_file(PassFile) of
-        {ok, Pass} -> Pass;
-        _ -> <<>>
+    case application:get_env(eredis_cluster, pass_file) of
+        undefined ->
+            undefined;
+        {ok, PassFile} ->
+            case file:read_file(PassFile) of
+                {ok, Pass} -> Pass;
+                _ -> <<>>
+            end
     end.
 
 authenticate(_Socket, <<>>) ->
