@@ -46,6 +46,13 @@
           queue :: eredis_queue() | undefined
 }).
 
+-record(queued_request, {
+    cmd_count = 1 :: pos_integer(),
+    from :: pid(),
+    replies :: list() | undefined,
+    request :: iolist()
+}).
+
 %%
 %% API
 %%
@@ -190,7 +197,8 @@ do_request(_Req, _From, #state{socket = undefined} = State) ->
 do_request(Req, From, State) ->
     case gen_tcp:send(State#state.socket, Req) of
         ok ->
-            NewQueue = queue:in({1, From}, State#state.queue),
+            Request = #queued_request{from = From, request = Req},
+            NewQueue = queue:in(Request, State#state.queue),
             {noreply, State#state{queue = NewQueue}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
@@ -206,7 +214,13 @@ do_pipeline(_Pipeline, _From, #state{socket = undefined} = State) ->
 do_pipeline(Pipeline, From, State) ->
     case gen_tcp:send(State#state.socket, Pipeline) of
         ok ->
-            NewQueue = queue:in({length(Pipeline), From, []}, State#state.queue),
+            Request = #queued_request{
+                cmd_count = length(Pipeline),
+                from = From,
+                replies = [],
+                request = Pipeline
+            },
+            NewQueue = queue:in(Request, State#state.queue),
             {noreply, State#state{queue = NewQueue}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
@@ -254,6 +268,16 @@ reply(Value, Queue) ->
             NewQueue;
         {{value, {N, From, Replies}}, NewQueue} when N > 1 ->
             queue:in_r({N - 1, From, [Value | Replies]}, NewQueue);
+        {{value, #queued_request{cmd_count = 1, from = From, replies = undefined}}, NewQueue} ->
+            safe_reply(From, Value),
+            NewQueue;
+        {{value, #queued_request{cmd_count = 1, from = From, replies = Replies}}, NewQueue} ->
+            safe_reply(From, lists:reverse([Value | Replies])),
+            NewQueue;
+        {{value, #queued_request{cmd_count = N} = Request}, NewQueue} when N > 1 ->
+            Replies = Request#queued_request.replies,
+            Tmp = Request#queued_request{cmd_count = N -1, replies = [Value|Replies]},
+            queue:in_r(Tmp, NewQueue);
         {empty, Queue} ->
             %% Oops
             error_logger:info_msg("Nothing in queue, but got value from parser~n"),
@@ -275,6 +299,8 @@ reply_all(Value, Queue) ->
 receipient({_, From}) ->
     From;
 receipient({_, From, _}) ->
+    From;
+receipient(#queued_request{from = From}) ->
     From.
 
 safe_reply(undefined, _Value) ->
