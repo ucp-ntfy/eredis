@@ -48,10 +48,13 @@
 
 -record(queued_request, {
     cmd_count = 1 :: pos_integer(),
+    no_auth_count = 0 :: non_neg_integer(),
     from :: pid(),
     replies :: list() | undefined,
     request :: iolist()
 }).
+
+-define(AUTH_FLAG, authenticate).
 
 %%
 %% API
@@ -226,6 +229,35 @@ do_pipeline(Pipeline, From, State) ->
             {reply, {error, Reason}, State}
     end.
 
+resend_request(#state{socket = Socket, queue = Queue} = State) ->
+    {{value, Item}, NewQueue} = queue:out(Queue),
+    #queued_request{
+        request = Request,
+        cmd_count = CmdCount,
+        no_auth_count = NoAuthCount
+    } = Item,
+
+    % Current NOAUTH is not counted yet, that's why +1.
+    if CmdCount == NoAuthCount + 1 ->
+        gen_tcp:send(Socket, Request),
+        State#state{
+            queue = queue:in(Item#queued_request{no_auth_count = 0}, NewQueue)
+        };
+    true ->
+        NewItem = Item#queued_request{no_auth_count = NoAuthCount + 1},
+        State#state{queue = queue:in_r(NewItem, NewQueue)}
+    end.
+
+handle_noauth(#state{socket = Socket, queue = Queue} = State, undefined) ->
+    send_authenticate(Socket, get_redis_password()),
+    put(?AUTH_FLAG, in_process),
+    resend_request(State#state{queue = queue:in(?AUTH_FLAG, Queue)});
+handle_noauth(State, _) ->
+    resend_request(State).
+
+handle_noauth(State) ->
+    handle_noauth(State, get(?AUTH_FLAG)).
+
 -spec handle_response(Data::binary(), State::#state{}) -> NewState::#state{}.
 %% @doc: Handle the response coming from Redis. This includes parsing
 %% and replying to the correct client, handling partial responses,
@@ -234,6 +266,11 @@ handle_response(Data, #state{parser_state = ParserState,
                              queue = Queue} = State) ->
 
     case eredis_parser:parse(ParserState, Data) of
+        {error,<<"NOAUTH Authentication required.">>, NewParserState} ->
+            handle_noauth(State#state{parser_state = NewParserState});
+        {error,<<"NOAUTH Authentication required.">>, Rest, NewParserState} ->
+            NewState = handle_noauth(State#state{parser_state = NewParserState}),
+            handle_response(Rest, NewState);
         %% Got complete response, return value to client
         {ReturnCode, Value, NewParserState} ->
             NewQueue = reply({ReturnCode, Value}, Queue),
@@ -260,6 +297,15 @@ handle_response(Data, #state{parser_state = ParserState,
 %% wait for another reply from redis.
 reply(Value, Queue) ->
     case queue:out(Queue) of
+        {{value, ?AUTH_FLAG}, NewQueue} ->
+            put(?AUTH_FLAG, undefined),
+            case Value of
+                {ok, _} ->
+                    NewQueue;
+                _ ->
+                    % we can't authenticate, so what to do?
+                    throw({?MODULE, ?LINE, Value})
+            end;
         {{value, {1, From}}, NewQueue} ->
             safe_reply(From, Value),
             NewQueue;
@@ -274,9 +320,13 @@ reply(Value, Queue) ->
         {{value, #queued_request{cmd_count = 1, from = From, replies = Replies}}, NewQueue} ->
             safe_reply(From, lists:reverse([Value | Replies])),
             NewQueue;
-        {{value, #queued_request{cmd_count = N} = Request}, NewQueue} when N > 1 ->
+        {{value, #queued_request{cmd_count = N, request = [_|Req]} = Request}, NewQueue} when N > 1 ->
             Replies = Request#queued_request.replies,
-            Tmp = Request#queued_request{cmd_count = N -1, replies = [Value|Replies]},
+            Tmp = Request#queued_request{
+                cmd_count = N -1,
+                replies = [Value|Replies],
+                request = Req
+            },
             queue:in_r(Tmp, NewQueue);
         {empty, Queue} ->
             %% Oops
