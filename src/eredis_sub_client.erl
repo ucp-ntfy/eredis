@@ -132,10 +132,9 @@ handle_cast(_Msg, State) ->
 
 handle_cast_internal(CmdName, State, Channels, ModifyChannels) ->
     Command = eredis:create_multibulk([CmdName | Channels]),
-    NewState = auth_on_the_fly(State),
-    ok = gen_tcp:send(NewState#state.socket, Command),
-    NewChannels = ModifyChannels(Channels, NewState#state.channels),
-    {noreply, NewState#state{channels = NewChannels}}.
+    ok = gen_tcp:send(State#state.socket, Command),
+    NewChannels = ModifyChannels(Channels, State#state.channels),
+    {noreply, State#state{channels = NewChannels}}.
 
 %% Receive data from socket, see handle_response/2
 handle_info({tcp, _Socket, Bs}, State) ->
@@ -308,8 +307,6 @@ connect(State) ->
         {ok, Socket} ->
             case authenticate(Socket, State#state.password) of
                 ok ->
-                    {ok, State#state{socket = Socket, password = done}};
-                skip ->
                     {ok, State#state{socket = Socket}};
                 {error, Reason} ->
                     {error, {authentication_error, Reason}}
@@ -321,11 +318,6 @@ connect(State) ->
 
 authenticate(Socket, Password) ->
     eredis_client:authenticate(Socket, Password).
-
-auth_on_the_fly(State) ->
-    State.
-% NOTE: eredis_client has different state record
-%    eredis_client:auth_on_the_fly(State).
 
 
 %% @doc: Loop until a connection can be established, this includes

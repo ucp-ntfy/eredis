@@ -27,7 +27,7 @@
 %% API
 -export([start_link/6, stop/1, select_database/2]).
 
--export([do_sync_command/2, authenticate/2, auth_on_the_fly/1]).
+-export([do_sync_command/2, authenticate/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -36,7 +36,7 @@
 -record(state, {
           host :: string() | undefined,
           port :: integer() | undefined,
-          password :: binary() | undefined | done,
+          password :: binary() | undefined,
           database :: binary() | undefined,
           reconnect_sleep :: reconnect_sleep() | undefined,
           connect_timeout :: integer() | undefined,
@@ -45,6 +45,16 @@
           parser_state :: #pstate{} | undefined,
           queue :: eredis_queue() | undefined
 }).
+
+-record(queued_request, {
+    cmd_count = 1 :: pos_integer(),
+    no_auth_count = 0 :: non_neg_integer(),
+    from :: pid(),
+    replies :: list() | undefined,
+    request :: iolist()
+}).
+
+-define(AUTH_FLAG, authenticate).
 
 %%
 %% API
@@ -88,12 +98,10 @@ init([Host, Port, Database, Password, ReconnectSleep, ConnectTimeout]) ->
     end.
 
 handle_call({request, Req}, From, State) ->
-    NewState = auth_on_the_fly(State),
-    do_request(Req, From, NewState);
+    do_request(Req, From, State);
 
 handle_call({pipeline, Pipeline}, From, State) ->
-    NewState = auth_on_the_fly(State),
-    do_pipeline(Pipeline, From, NewState);
+    do_pipeline(Pipeline, From, State);
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -103,8 +111,7 @@ handle_call(_Request, _From, State) ->
 
 
 handle_cast({request, Req}, State) ->
-    NewState = auth_on_the_fly(State),
-    case do_request(Req, undefined, NewState) of
+    case do_request(Req, undefined, State) of
         {reply, _Reply, State1} ->
             {noreply, State1};
         {noreply, State1} ->
@@ -193,7 +200,8 @@ do_request(_Req, _From, #state{socket = undefined} = State) ->
 do_request(Req, From, State) ->
     case gen_tcp:send(State#state.socket, Req) of
         ok ->
-            NewQueue = queue:in({1, From}, State#state.queue),
+            Request = #queued_request{from = From, request = Req},
+            NewQueue = queue:in(Request, State#state.queue),
             {noreply, State#state{queue = NewQueue}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
@@ -209,11 +217,46 @@ do_pipeline(_Pipeline, _From, #state{socket = undefined} = State) ->
 do_pipeline(Pipeline, From, State) ->
     case gen_tcp:send(State#state.socket, Pipeline) of
         ok ->
-            NewQueue = queue:in({length(Pipeline), From, []}, State#state.queue),
+            Request = #queued_request{
+                cmd_count = length(Pipeline),
+                from = From,
+                replies = [],
+                request = Pipeline
+            },
+            NewQueue = queue:in(Request, State#state.queue),
             {noreply, State#state{queue = NewQueue}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end.
+
+resend_request(#state{socket = Socket, queue = Queue} = State) ->
+    {{value, Item}, NewQueue} = queue:out(Queue),
+    #queued_request{
+        request = Request,
+        cmd_count = CmdCount,
+        no_auth_count = NoAuthCount
+    } = Item,
+
+    % Current NOAUTH is not counted yet, that's why +1.
+    if CmdCount == NoAuthCount + 1 ->
+        gen_tcp:send(Socket, Request),
+        State#state{
+            queue = queue:in(Item#queued_request{no_auth_count = 0}, NewQueue)
+        };
+    true ->
+        NewItem = Item#queued_request{no_auth_count = NoAuthCount + 1},
+        State#state{queue = queue:in_r(NewItem, NewQueue)}
+    end.
+
+handle_noauth(#state{socket = Socket, queue = Queue} = State, undefined) ->
+    send_authenticate(Socket, get_redis_password()),
+    put(?AUTH_FLAG, in_process),
+    resend_request(State#state{queue = queue:in(?AUTH_FLAG, Queue)});
+handle_noauth(State, _) ->
+    resend_request(State).
+
+handle_noauth(State) ->
+    handle_noauth(State, get(?AUTH_FLAG)).
 
 -spec handle_response(Data::binary(), State::#state{}) -> NewState::#state{}.
 %% @doc: Handle the response coming from Redis. This includes parsing
@@ -223,6 +266,11 @@ handle_response(Data, #state{parser_state = ParserState,
                              queue = Queue} = State) ->
 
     case eredis_parser:parse(ParserState, Data) of
+        {error,<<"NOAUTH Authentication required.">>, NewParserState} ->
+            handle_noauth(State#state{parser_state = NewParserState});
+        {error,<<"NOAUTH Authentication required.">>, Rest, NewParserState} ->
+            NewState = handle_noauth(State#state{parser_state = NewParserState}),
+            handle_response(Rest, NewState);
         %% Got complete response, return value to client
         {ReturnCode, Value, NewParserState} ->
             NewQueue = reply({ReturnCode, Value}, Queue),
@@ -249,6 +297,15 @@ handle_response(Data, #state{parser_state = ParserState,
 %% wait for another reply from redis.
 reply(Value, Queue) ->
     case queue:out(Queue) of
+        {{value, ?AUTH_FLAG}, NewQueue} ->
+            put(?AUTH_FLAG, undefined),
+            case Value of
+                {ok, _} ->
+                    NewQueue;
+                _ ->
+                    % we can't authenticate, so what to do?
+                    throw({?MODULE, ?LINE, Value})
+            end;
         {{value, {1, From}}, NewQueue} ->
             safe_reply(From, Value),
             NewQueue;
@@ -257,6 +314,20 @@ reply(Value, Queue) ->
             NewQueue;
         {{value, {N, From, Replies}}, NewQueue} when N > 1 ->
             queue:in_r({N - 1, From, [Value | Replies]}, NewQueue);
+        {{value, #queued_request{cmd_count = 1, from = From, replies = undefined}}, NewQueue} ->
+            safe_reply(From, Value),
+            NewQueue;
+        {{value, #queued_request{cmd_count = 1, from = From, replies = Replies}}, NewQueue} ->
+            safe_reply(From, lists:reverse([Value | Replies])),
+            NewQueue;
+        {{value, #queued_request{cmd_count = N, request = [_|Req]} = Request}, NewQueue} when N > 1 ->
+            Replies = Request#queued_request.replies,
+            Tmp = Request#queued_request{
+                cmd_count = N -1,
+                replies = [Value|Replies],
+                request = Req
+            },
+            queue:in_r(Tmp, NewQueue);
         {empty, Queue} ->
             %% Oops
             error_logger:info_msg("Nothing in queue, but got value from parser~n"),
@@ -278,6 +349,8 @@ reply_all(Value, Queue) ->
 receipient({_, From}) ->
     From;
 receipient({_, From, _}) ->
+    From;
+receipient(#queued_request{from = From}) ->
     From.
 
 safe_reply(undefined, _Value) ->
@@ -293,18 +366,11 @@ connect(State) ->
     case gen_tcp:connect(State#state.host, State#state.port,
                          ?SOCKET_OPTS, State#state.connect_timeout) of
         {ok, Socket} ->
-            case authenticate(Socket, State#state.password) of
-                skip ->
-                    case select_database(Socket, State#state.database) of
-                        ok ->
-                            {ok, State#state{socket = Socket}};
-                        {error, Reason} ->
-                            {error, {select_error, Reason}}
-                    end;
+            case authenticate(Socket, get_redis_password()) of
                 ok ->
                     case select_database(Socket, State#state.database) of
                         ok ->
-                            {ok, State#state{socket = Socket, password = done}};
+                            {ok, State#state{socket = Socket}};
                         {error, Reason} ->
                             {error, {select_error, Reason}}
                     end;
@@ -329,20 +395,24 @@ get_redis_password() ->
         {ok, PassFile} ->
             case file:read_file(PassFile) of
                 {ok, Pass} -> Pass;
-                _ -> <<>>
+                _ -> undefined
             end
     end.
 
-authenticate(_Socket, <<>>) ->
-    skip;
+send_authenticate(Socket, Password) ->
+    AuthCmd = eredis:create_multibulk([<<"AUTH">>, Password]),
+    gen_tcp:send(Socket, AuthCmd).
+
+authenticate(_Socket, undefined) ->
+    ok;
 authenticate(Sock, Pass) ->
     {ok, Opts} = inet:getopts(Sock, [active]),
     ok = inet:setopts(Sock, [{active, false}]),
-    Result = case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
+    Result = case send_authenticate(Sock, Pass) of
         ok ->
             case gen_tcp:recv(Sock, 0) of
                 {ok, <<"+OK\r\n">>} -> ok;
-                {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> skip;
+                {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> ok;
                 {ok, Err} -> {error, Err};
                 Err -> Err
             end;
@@ -351,16 +421,6 @@ authenticate(Sock, Pass) ->
     end,
     ok = inet:setopts(Sock, Opts),
     Result.
-
-auth_on_the_fly(#state{password = done} = State) ->
-    State;
-auth_on_the_fly(#state{socket = Socket} = State) ->
-    case authenticate(Socket, get_redis_password()) of
-        ok ->
-            State#state{password = done};
-        _ ->
-            State
-    end.
 
 %% @doc: Executes the given command synchronously, expects Redis to
 %% return "+OK\r\n", otherwise it will fail.
@@ -384,7 +444,7 @@ do_sync_command(Socket, Command) ->
 %% successfully issuing the auth and select calls. When we have a
 %% connection, give the socket to the redis client.
 reconnect_loop(Client, #state{reconnect_sleep = ReconnectSleep} = State) ->
-    case catch(connect(State#state{password = get_redis_password()})) of
+    case catch(connect(State)) of
         {ok, #state{socket = Socket}} ->
             gen_tcp:controlling_process(Socket, Client),
             Client ! {connection_ready, Socket};
